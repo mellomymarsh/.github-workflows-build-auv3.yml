@@ -1,0 +1,302 @@
+name: Build Native iPhone AUv3 IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-ipa:
+    runs-on: macos-14
+    steps:
+      - name: Generate Complete AUv3 Xcode Project & Source Files
+        run: |
+          mkdir -p MIDIVideoScrubber/App
+          mkdir -p MIDIVideoScrubber/Extension
+
+          # 1. Host App Entry Point
+          cat << 'EOF' > MIDIVideoScrubber/App/App.swift
+          import SwiftUI
+          @main
+          struct HostApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      VStack(spacing: 16) {
+                          Image(systemName: "film.stack")
+                              .font(.system(size: 56))
+                              .foregroundColor(.red)
+                          Text("MIDI Video Scrubber AUv3")
+                              .font(.title2.bold())
+                          Text("Open AUM, Drambo, GarageBand, or Loopy Pro and load 'MIDI Video Scrubber' as a MIDI Instrument (aumu).")
+                              .multilineTextAlignment(.center)
+                              .foregroundColor(.secondary)
+                              .padding(.horizontal, 32)
+                      }
+                  }
+              }
+          }
+          EOF
+
+          # 2. Host App Info.plist
+          cat << 'EOF' > MIDIVideoScrubber/App/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key><string>en</string>
+              <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+              <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+              <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+              <key>CFBundleName</key><string>MIDIVideoScrubber</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>CFBundleShortVersionString</key><string>1.0</string>
+              <key>CFBundleVersion</key><string>1</string>
+              <key>UILaunchScreen</key><dict/>
+          </dict>
+          </plist>
+          EOF
+
+          # 3. Complete Self-Contained Swift AUv3 AudioUnit + Video Player UI
+          cat << 'EOF' > MIDIVideoScrubber/Extension/VideoScrubberAUViewController.swift
+          import CoreAudioKit
+          import AudioToolbox
+          import AVFoundation
+          import UniformTypeIdentifiers
+          import UIKit
+
+          public final class VideoScrubberAudioUnit: AUAudioUnit {
+              private var outputBusArray: AUAudioUnitBusArray!
+              public var latestNote: Int32 = -1
+              public var isNoteHeld: Bool = false
+
+              public override init(componentDescription: AudioComponentDescription, options: AudioComponentInstantiationOptions = []) throws {
+                  try super.init(componentDescription: componentDescription, options: options)
+                  let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
+                  let bus = try AUAudioUnitBus(format: format)
+                  outputBusArray = AUAudioUnitBusArray(audioUnit: self, busType: .output, busses: [bus])
+              }
+
+              public override var outputBusses: AUAudioUnitBusArray { outputBusArray }
+
+              public override var internalRenderBlock: AUInternalRenderBlock {
+                  return { [weak self] _, _, frameCount, _, outputData, realtimeEventListHead, _ in
+                      let ablPointer = UnsafeMutableAudioBufferListPointer(outputData)
+                      for buffer in ablPointer {
+                          memset(buffer.mData, 0, Int(buffer.mDataByteSize))
+                      }
+                      var eventPtr = realtimeEventListHead
+                      while let ptr = eventPtr {
+                          if ptr.pointee.head.eventType == .MIDI {
+                              let midi = ptr.pointee.MIDI
+                              let status = midi.data.0 & 0xF0
+                              let note = Int32(midi.data.1 & 0x7F)
+                              let vel = midi.data.2 & 0x7F
+                              if status == 0x90 && vel > 0 {
+                                  self?.latestNote = note
+                                  self?.isNoteHeld = true
+                              } else if status == 0x80 || (status == 0x90 && vel == 0) {
+                                  if self?.latestNote == note {
+                                      self?.isNoteHeld = false
+                                  }
+                              }
+                          }
+                          eventPtr = UnsafePointer(ptr.pointee.head.next)
+                      }
+                      return noErr
+                  }
+              }
+          }
+
+          @objc(VideoScrubberAUViewController)
+          public class VideoScrubberAUViewController: AUViewController, AUAudioUnitFactory, UIDocumentPickerDelegate {
+              private var audioUnit: VideoScrubberAudioUnit?
+              private var player: AVPlayer?
+              private var playerLayer: AVPlayerLayer?
+              private var duration: Double = 0.0
+              private var displayLink: CADisplayLink?
+              private var lastTriggeredNote: Int32 = -1
+
+              private let importBtn = UIButton(type: .system)
+              private let statusLbl = UILabel()
+
+              public func createAudioUnit(with desc: AudioComponentDescription) throws -> AUAudioUnit {
+                  let au = try VideoScrubberAudioUnit(componentDescription: desc, options: [])
+                  self.audioUnit = au
+                  return au
+              }
+
+              public override func viewDidLoad() {
+                  super.viewDidLoad()
+                  view.backgroundColor = .black
+                  let p = AVPlayer()
+                  p.isMuted = true
+                  self.player = p
+
+                  let layer = AVPlayerLayer(player: p)
+                  layer.videoGravity = .resizeAspect
+                  view.layer.addSublayer(layer)
+                  self.playerLayer = layer
+
+                  importBtn.setTitle("Import Video", for: .normal)
+                  importBtn.backgroundColor = UIColor.systemRed
+                  importBtn.setTitleColor(.white, for: .normal)
+                  importBtn.layer.cornerRadius = 8
+                  importBtn.translatesAutoresizingMaskIntoConstraints = false
+                  importBtn.addTarget(self, action: #selector(pickVideo), for: .touchUpInside)
+
+                  statusLbl.text = "Import a video & play MIDI notes (36 - 96)"
+                  statusLbl.textColor = .white
+                  statusLbl.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+                  statusLbl.translatesAutoresizingMaskIntoConstraints = false
+
+                  view.addSubview(importBtn)
+                  view.addSubview(statusLbl)
+
+                  NSLayoutConstraint.activate([
+                      importBtn.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
+                      importBtn.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+                      importBtn.widthAnchor.constraint(equalToConstant: 120),
+                      importBtn.heightAnchor.constraint(equalToConstant: 36),
+                      statusLbl.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
+                      statusLbl.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12)
+                  ])
+
+                  displayLink = CADisplayLink(target: self, selector: #selector(pollMIDI))
+                  displayLink?.add(to: .main, forMode: .common)
+              }
+
+              public override func viewDidLayoutSubviews() {
+                  super.viewDidLayoutSubviews()
+                  playerLayer?.frame = view.bounds
+              }
+
+              @objc private func pickVideo() {
+                  let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.movie, .mpeg4Movie, .quickTimeMovie])
+                  picker.delegate = self
+                  present(picker, animated: true)
+              }
+
+              public func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+                  guard let url = urls.first, url.startAccessingSecurityScopedResource() else { return }
+                  defer { url.stopAccessingSecurityScopedResource() }
+                  let dst = FileManager.default.temporaryDirectory.appendingPathComponent(url.lastPathComponent)
+                  try? FileManager.default.removeItem(at: dst)
+                  try? FileManager.default.copyItem(at: url, to: dst)
+
+                  let asset = AVURLAsset(url: dst)
+                  Task {
+                      if let dur = try? await asset.load(.duration) {
+                          let secs = CMTimeGetSeconds(dur)
+                          await MainActor.run {
+                              self.duration = max(secs, 0.0)
+                              self.player?.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+                              self.statusLbl.text = String(format: "Loaded (%.1fs) - Send MIDI Notes", secs)
+                          }
+                      }
+                  }
+              }
+
+              @objc private func pollMIDI() {
+                  guard let au = audioUnit, duration > 0, let player = player else { return }
+                  let note = au.latestNote
+                  if note >= 0 && note != lastTriggeredNote {
+                      lastTriggeredNote = note
+                      let clamped = Double(max(36, min(96, note)) - 36) / 60.0
+                      let target = clamped * duration
+                      let time = CMTime(seconds: target, preferredTimescale: 600)
+                      player.currentItem?.cancelPendingSeeks()
+                      player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+                      statusLbl.text = String(format: "MIDI Note %d -> %.2fs", note, target)
+                  }
+              }
+          }
+          EOF
+
+          # 4. AUv3 Extension Info.plist
+          cat << 'EOF' > MIDIVideoScrubber/Extension/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key><string>en</string>
+              <key>CFBundleDisplayName</key><string>MIDI Video Scrubber</string>
+              <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+              <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+              <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+              <key>CFBundleName</key><string>MIDIVideoScrubberExtension</string>
+              <key>CFBundlePackageType</key><string>XPC!</string>
+              <key>CFBundleShortVersionString</key><string>1.0</string>
+              <key>CFBundleVersion</key><string>1</string>
+              <key>NSExtension</key>
+              <dict>
+                  <key>NSExtensionAttributes</key>
+                  <dict>
+                      <key>AudioComponents</key>
+                      <array>
+                          <dict>
+                              <key>description</key><string>MIDI Video Scrubber AUv3</string>
+                              <key>factoryFunction</key><string>$(PRODUCT_MODULE_NAME).VideoScrubberAUViewController</string>
+                              <key>manufacturer</key><string>Vids</string>
+                              <key>name</key><string>Custom: MIDI Video Scrubber</string>
+                              <key>sandboxSafe</key><true/>
+                              <key>subtype</key><string>vidm</string>
+                              <key>tags</key><array><string>Synthesizer</string></array>
+                              <key>type</key><string>aumu</string>
+                              <key>version</key><integer>1</integer>
+                          </dict>
+                      </array>
+                  </dict>
+                  <key>NSExtensionMainStoryboard</key><string></string>
+                  <key>NSExtensionPointIdentifier</key><string>com.apple.AudioUnit-UI</string>
+                  <key>NSExtensionPrincipalClass</key><string>$(PRODUCT_MODULE_NAME).VideoScrubberAUViewController</string>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+
+          # 5. XcodeGen Project Spec
+          cat << 'EOF' > project.yml
+          name: MIDIVideoScrubber
+          options:
+            bundleIdPrefix: com.custom.midivideoscrubber
+            deploymentTarget:
+              iOS: "16.0"
+          targets:
+            MIDIVideoScrubber:
+              type: application
+              platform: iOS
+              sources: [MIDIVideoScrubber/App]
+              info:
+                path: MIDIVideoScrubber/App/Info.plist
+              dependencies:
+                - target: MIDIVideoScrubberExtension
+            MIDIVideoScrubberExtension:
+              type: app-extension
+              platform: iOS
+              sources: [MIDIVideoScrubber/Extension]
+              info:
+                path: MIDIVideoScrubber/Extension/Info.plist
+              settings:
+                LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"
+          EOF
+
+      - name: Generate Xcode Project & Compile Unsigned IPA
+        run: |
+          xcodegen generate
+          xcodebuild -project MIDIVideoScrubber.xcodeproj \
+            -scheme MIDIVideoScrubber \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/MIDIVideoScrubber.app Payload/
+          zip -r MIDIVideoScrubber.ipa Payload
+
+      - name: Upload Finished IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIDIVideoScrubber-iOS-AUv3-IPA
+          path: MIDIVideoScrubber.ipa
