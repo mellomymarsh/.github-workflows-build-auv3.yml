@@ -7,8 +7,14 @@ on:
 
 jobs:
   build-ipa:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+
       - name: Generate Complete AUv3 Xcode Project & Source Files
         run: |
           mkdir -p MIDIVideoScrubber/App
@@ -67,7 +73,9 @@ jobs:
           public final class VideoScrubberAudioUnit: AUAudioUnit {
               private var outputBusArray: AUAudioUnitBusArray!
               public var latestNote: Int32 = -1
+              public var noteTriggerCounter: Int32 = 0
               public var isNoteHeld: Bool = false
+              public var hostBPM: Double = 120.0
 
               public override init(componentDescription: AudioComponentDescription, options: AudioComponentInstantiationOptions = []) throws {
                   try super.init(componentDescription: componentDescription, options: options)
@@ -82,7 +90,15 @@ jobs:
                   return { [weak self] _, _, frameCount, _, outputData, realtimeEventListHead, _ in
                       let ablPointer = UnsafeMutableAudioBufferListPointer(outputData)
                       for buffer in ablPointer {
-                          memset(buffer.mData, 0, Int(buffer.mDataByteSize))
+                          if let mData = buffer.mData {
+                              memset(mData, 0, Int(buffer.mDataByteSize))
+                          }
+                      }
+                      if let contextBlock = self?.musicalContextBlock {
+                          var tempo: Double = 120.0
+                          if contextBlock(&tempo, nil, nil, nil, nil, nil) {
+                              self?.hostBPM = tempo
+                          }
                       }
                       var eventPtr = realtimeEventListHead
                       while let ptr = eventPtr {
@@ -94,6 +110,7 @@ jobs:
                               if status == 0x90 && vel > 0 {
                                   self?.latestNote = note
                                   self?.isNoteHeld = true
+                                  self?.noteTriggerCounter &+= 1
                               } else if status == 0x80 || (status == 0x90 && vel == 0) {
                                   if self?.latestNote == note {
                                       self?.isNoteHeld = false
@@ -114,9 +131,12 @@ jobs:
               private var playerLayer: AVPlayerLayer?
               private var duration: Double = 0.0
               private var displayLink: CADisplayLink?
-              private var lastTriggeredNote: Int32 = -1
+              private var lastSeenCounter: Int32 = 0
+              private var sliceRatios: [Double] = (0..<16).map { Double($0) / 16.0 }
+              private var lastStutterTime: CFTimeInterval = 0
 
               private let importBtn = UIButton(type: .system)
+              private let modeSegment = UISegmentedControl(items: ["Scrub", "Gate", "1/16 Stutter"])
               private let statusLbl = UILabel()
 
               public func createAudioUnit(with desc: AudioComponentDescription) throws -> AUAudioUnit {
@@ -140,25 +160,38 @@ jobs:
                   importBtn.setTitle("Import Video", for: .normal)
                   importBtn.backgroundColor = UIColor.systemRed
                   importBtn.setTitleColor(.white, for: .normal)
+                  importBtn.titleLabel?.font = .systemFont(ofSize: 13, weight: .bold)
                   importBtn.layer.cornerRadius = 8
                   importBtn.translatesAutoresizingMaskIntoConstraints = false
                   importBtn.addTarget(self, action: #selector(pickVideo), for: .touchUpInside)
 
-                  statusLbl.text = "Import a video & play MIDI notes (36 - 96)"
+                  modeSegment.selectedSegmentIndex = 1
+                  modeSegment.backgroundColor = UIColor.black.withAlphaComponent(0.7)
+                  modeSegment.selectedSegmentTintColor = UIColor.systemRed
+                  modeSegment.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .normal)
+                  modeSegment.translatesAutoresizingMaskIntoConstraints = false
+
+                  statusLbl.text = "Import Video • MIDI Notes 36-51 (16 Slices) or 36-96"
                   statusLbl.textColor = .white
-                  statusLbl.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+                  statusLbl.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
                   statusLbl.translatesAutoresizingMaskIntoConstraints = false
 
                   view.addSubview(importBtn)
+                  view.addSubview(modeSegment)
                   view.addSubview(statusLbl)
 
                   NSLayoutConstraint.activate([
-                      importBtn.topAnchor.constraint(equalTo: view.topAnchor, constant: 12),
-                      importBtn.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-                      importBtn.widthAnchor.constraint(equalToConstant: 120),
-                      importBtn.heightAnchor.constraint(equalToConstant: 36),
-                      statusLbl.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
-                      statusLbl.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12)
+                      importBtn.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+                      importBtn.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+                      importBtn.widthAnchor.constraint(equalToConstant: 110),
+                      importBtn.heightAnchor.constraint(equalToConstant: 32),
+
+                      modeSegment.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+                      modeSegment.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
+                      modeSegment.heightAnchor.constraint(equalToConstant: 32),
+
+                      statusLbl.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -10),
+                      statusLbl.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10)
                   ])
 
                   displayLink = CADisplayLink(target: self, selector: #selector(pollMIDI))
@@ -190,23 +223,56 @@ jobs:
                           await MainActor.run {
                               self.duration = max(secs, 0.0)
                               self.player?.replaceCurrentItem(with: AVPlayerItem(asset: asset))
-                              self.statusLbl.text = String(format: "Loaded (%.1fs) - Send MIDI Notes", secs)
+                              self.statusLbl.text = String(format: "Loaded (%.1fs) - Ready for MIDI", secs)
                           }
                       }
                   }
               }
 
+              private func targetTimeForNote(_ note: Int32) -> Double {
+                  let idx = Int(note - 36)
+                  if idx >= 0 && idx < 16 {
+                      return sliceRatios[idx] * duration
+                  }
+                  let clamped = Double(max(36, min(96, note)) - 36) / 60.0
+                  return clamped * duration
+              }
+
               @objc private func pollMIDI() {
                   guard let au = audioUnit, duration > 0, let player = player else { return }
+                  let counter = au.noteTriggerCounter
                   let note = au.latestNote
-                  if note >= 0 && note != lastTriggeredNote {
-                      lastTriggeredNote = note
-                      let clamped = Double(max(36, min(96, note)) - 36) / 60.0
-                      let target = clamped * duration
+                  let mode = modeSegment.selectedSegmentIndex
+
+                  if counter != lastSeenCounter && note >= 0 {
+                      lastSeenCounter = counter
+                      lastStutterTime = CACurrentMediaTime()
+                      let target = targetTimeForNote(note)
                       let time = CMTime(seconds: target, preferredTimescale: 600)
                       player.currentItem?.cancelPendingSeeks()
                       player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
-                      statusLbl.text = String(format: "MIDI Note %d -> %.2fs", note, target)
+                      if mode == 0 {
+                          player.pause()
+                      } else {
+                          player.play()
+                      }
+                      statusLbl.text = String(format: "Note %d -> %.2fs (%.0f BPM)", note, target, au.hostBPM)
+                  } else if au.isNoteHeld && mode == 2 && note >= 0 {
+                      // 1/16 Note Host-BPM Stutter
+                      let sixteenthSec = (60.0 / max(40.0, au.hostBPM)) * 0.25
+                      let now = CACurrentMediaTime()
+                      if now - lastStutterTime >= sixteenthSec {
+                          lastStutterTime = now
+                          let target = targetTimeForNote(note)
+                          let time = CMTime(seconds: target, preferredTimescale: 600)
+                          player.currentItem?.cancelPendingSeeks()
+                          player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+                          player.play()
+                      }
+                  } else if !au.isNoteHeld && mode > 0 {
+                      if player.rate > 0 {
+                          player.pause()
+                      }
                   }
               }
           }
@@ -268,6 +334,11 @@ jobs:
               sources: [MIDIVideoScrubber/App]
               info:
                 path: MIDIVideoScrubber/App/Info.plist
+              settings:
+                PRODUCT_BUNDLE_IDENTIFIER: com.custom.midivideoscrubber
+                CODE_SIGNING_ALLOWED: NO
+                CODE_SIGNING_REQUIRED: NO
+                CODE_SIGN_IDENTITY: ""
               dependencies:
                 - target: MIDIVideoScrubberExtension
             MIDIVideoScrubberExtension:
@@ -277,7 +348,11 @@ jobs:
               info:
                 path: MIDIVideoScrubber/Extension/Info.plist
               settings:
+                PRODUCT_BUNDLE_IDENTIFIER: com.custom.midivideoscrubber.extension
                 LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"
+                CODE_SIGNING_ALLOWED: NO
+                CODE_SIGNING_REQUIRED: NO
+                CODE_SIGN_IDENTITY: ""
           EOF
 
       - name: Generate Xcode Project & Compile Unsigned IPA
